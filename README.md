@@ -28,12 +28,11 @@ This is an integration module that allows you to connect your WHMCS installation
 * **Get EPP Code** (Auth Code).
 * **Domain Search** (Availability Check) directly within WHMCS.
 * **Synchronization** of expiry dates and status automatically via WHMCS cron.
+* **DNS Management** please use ns1.wdns.se ns2.wdns.se whitelabel DNS when using the DNS.
 
 ### Limitations (Good to Know)
 The following features are not currently supported by the API. Attempting to use them in WHMCS will result in an error message:
 * Registrar Lock (Lock/Unlock domain).
-* DNS Management (Host Records).
-* ID Protection (Whois Privacy) toggle.
 
 ### Tips
 If you receive error messages during registration, please verify that you have set the correct **Organization Number/Tax ID** for the client in WHMCS, as this is often required for .se/.nu domains.
