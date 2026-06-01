@@ -124,7 +124,10 @@ function hostupreseller_http(array $params, $method, $path, $payload = null, arr
     curl_setopt($ch, CURLOPT_TIMEOUT, $timeout > 0 ? $timeout : 30);
 
     if ($payload !== null) {
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+        $jsonPayload = is_array($payload) && empty($payload)
+            ? "{}"
+            : json_encode($payload);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $jsonPayload);
     }
 
     $raw = curl_exec($ch);
