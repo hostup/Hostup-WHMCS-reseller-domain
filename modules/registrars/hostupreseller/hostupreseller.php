@@ -8,6 +8,8 @@ use WHMCS\Domains\DomainLookup\ResultsList;
 use WHMCS\Domains\DomainLookup\SearchResult;
 use WHMCS\Carbon;
 use WHMCS\Domain\Registrar\Domain as RegistrarDomain;
+use WHMCS\Domain\TopLevel\ImportItem;
+use WHMCS\Results\ResultsList as TldResultsList;
 
 const HOSTUP_DEFAULT_BASE = "https://cloud.hostup.se";
 
@@ -67,13 +69,14 @@ function hostupreseller_config_validate($params)
         throw new \WHMCS\Exception\Module\InvalidConfiguration("API Key is required");
     }
 
-    // Test API connectivity
+    // Test API connectivity against an authenticated v2 endpoint.
     $base = rtrim($params["apiBase"] ?: HOSTUP_DEFAULT_BASE, "/");
-    $ch = curl_init($base . "/api/domain-products");
+    $ch = curl_init($base . "/api/v2/domains?limit=1");
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_TIMEOUT, 10);
     curl_setopt($ch, CURLOPT_HTTPHEADER, array(
         "Authorization: Bearer " . $params["apiKey"],
+        "Accept: application/json",
         "Content-Type: application/json",
     ));
 
@@ -107,7 +110,7 @@ function hostupreseller_http(array $params, $method, $path, $payload = null, arr
         $url .= "?" . http_build_query($query);
     }
 
-    $headers = array("Content-Type: application/json");
+    $headers = array("Accept: application/json", "Content-Type: application/json");
     if (!empty($params["apiKey"])) {
         $headers[] = "Authorization: Bearer " . $params["apiKey"];
     }
@@ -150,8 +153,41 @@ function hostupreseller_http(array $params, $method, $path, $payload = null, arr
         return array("success" => false, "error" => "HTTP request failed: " . $errno);
     }
 
+    if ($raw === false) {
+        $raw = "";
+    }
+
+    if ($raw === "" || $status === 204) {
+        if ($status >= 200 && $status < 300) {
+            if ($shouldLog && function_exists("logModuleCall")) {
+                logModuleCall("hostupreseller", "{$method} {$path}", $logPayload, $raw, "success");
+            }
+            return array("success" => true, "data" => array(), "http_status" => $status);
+        }
+
+        if ($shouldLog && function_exists("logModuleCall")) {
+            logModuleCall(
+                "hostupreseller",
+                "{$method} {$path}",
+                $logPayload,
+                $raw,
+                array(
+                    "error" => "Empty response from API",
+                    "http_status" => $status,
+                )
+            );
+        }
+
+        return array(
+            "success" => false,
+            "error" => "Empty response from API",
+            "http_status" => $status,
+            "raw" => $raw,
+        );
+    }
+
     $data = json_decode($raw, true);
-    if (!$data) {
+    if ($data === null && json_last_error() !== JSON_ERROR_NONE) {
         if ($shouldLog && function_exists("logModuleCall")) {
             logModuleCall(
                 "hostupreseller",
@@ -160,27 +196,35 @@ function hostupreseller_http(array $params, $method, $path, $payload = null, arr
                 $raw,
                 array(
                     "error" => "Unable to decode response",
+                    "json_error" => json_last_error_msg(),
                     "http_status" => $status,
                 )
             );
         }
         return array(
             "success" => false,
-            "error" => "Unable to decode response",
+            "error" => "Unable to decode response: " . json_last_error_msg(),
             "http_status" => $status,
             "raw" => $raw,
         );
     }
 
     $formatValidationErrors = function ($responseData) {
-        if (empty($responseData["details"]) || !is_array($responseData["details"])) {
+        $items = array();
+        if (!empty($responseData["details"]) && is_array($responseData["details"])) {
+            $items = $responseData["details"];
+        } elseif (!empty($responseData["errors"]) && is_array($responseData["errors"])) {
+            $items = $responseData["errors"];
+        }
+
+        if (empty($items)) {
             return "";
         }
 
         $messages = array();
-        foreach ($responseData["details"] as $detail) {
-            $field = isset($detail["field"]) ? $detail["field"] : null;
-            $message = isset($detail["message"]) ? $detail["message"] : null;
+        foreach ($items as $detail) {
+            $field = isset($detail["field"]) ? $detail["field"] : ($detail["pointer"] ?? null);
+            $message = isset($detail["message"]) ? $detail["message"] : ($detail["detail"] ?? null);
 
             if ($field && $message) {
                 $messages[] = "{$field}: {$message}";
@@ -202,14 +246,36 @@ function hostupreseller_http(array $params, $method, $path, $payload = null, arr
     $log("request", $payload);
     $log("response", $data);
 
-    if ($status >= 200 && $status < 300 && !empty($data["success"])) {
+    if ($status >= 200 && $status < 300) {
+        if (isset($data["success"]) && !$data["success"]) {
+            $message = $data["message"] ?? $data["error"] ?? "API request failed";
+            return array(
+                "success" => false,
+                "error" => $message,
+                "http_status" => $status,
+                "body" => $data,
+                "request_id" => $data["requestId"] ?? null,
+            );
+        }
+
         if ($shouldLog && function_exists("logModuleCall")) {
             logModuleCall("hostupreseller", "{$method} {$path}", $logPayload, $data, "success");
         }
-        return array("success" => true, "data" => ($data["data"] ?? $data));
+
+        $responseData = (isset($data["success"]) && array_key_exists("data", $data))
+            ? $data["data"]
+            : $data;
+
+        return array(
+            "success" => true,
+            "data" => $responseData,
+            "http_status" => $status,
+            "body" => $data,
+            "request_id" => $data["requestId"] ?? null,
+        );
     }
 
-    $message = $data["message"] ?? $data["error"] ?? "Unknown error";
+    $message = $data["detail"] ?? ($data["message"] ?? ($data["error"] ?? ($data["title"] ?? "HTTP {$status}")));
     $validationDetails = $formatValidationErrors($data);
     if (!empty($validationDetails)) {
         $message .= " (" . $validationDetails . ")";
@@ -242,29 +308,7 @@ function hostupreseller_http(array $params, $method, $path, $payload = null, arr
  */
 function hostupreseller_getProductId(array $params, $tld)
 {
-    static $cache = null;
-
-    if ($cache === null) {
-        $resp = hostupreseller_http($params, "GET", "/api/domain-products");
-        if (!$resp["success"]) {
-            return array(null, $resp["error"]);
-        }
-
-        $cache = array();
-        $products = $resp["data"]["tlds"] ?? array();
-        foreach ($products as $product) {
-            if (!empty($product["tld"]) && !empty($product["productId"])) {
-                $cache[strtolower($product["tld"])] = $product["productId"];
-            }
-        }
-    }
-
-    $key = "." . ltrim(strtolower($tld), ".");
-    if (!isset($cache[$key])) {
-        return array(null, "No product id found for TLD {$key}");
-    }
-
-    return array($cache[$key], null);
+    return array(null, "Product IDs are internal in v2; create domain orders with /api/v2/orders.");
 }
 
 function hostupreseller_collectNameservers(array $params)
@@ -414,29 +458,108 @@ function hostupreseller_buildContact(array $params)
     );
 }
 
+function hostupreseller_cleanString($value)
+{
+    if ($value === null) {
+        return null;
+    }
+    if (is_string($value) || is_numeric($value)) {
+        $trimmed = trim((string) $value);
+        return $trimmed === "" ? null : $trimmed;
+    }
+    return null;
+}
+
+function hostupreseller_setIfNotEmpty(array &$target, $key, $value)
+{
+    $clean = hostupreseller_cleanString($value);
+    if ($clean !== null) {
+        $target[$key] = $clean;
+    }
+}
+
+function hostupreseller_registrationIdentifierForV2($orgno, $tld)
+{
+    $formatted = hostupreseller_formatOrgnoForApi($orgno, $tld);
+    $formatted = hostupreseller_cleanString($formatted);
+    if ($formatted === null) {
+        return null;
+    }
+
+    if (preg_match('/^\[([A-Za-z]{2})\](.*)$/', $formatted, $matches)) {
+        $value = trim($matches[2]);
+        if ($value === "") {
+            return null;
+        }
+        return array(
+            "value" => $value,
+            "countryCode" => strtoupper($matches[1]),
+        );
+    }
+
+    return array(
+        "value" => $formatted,
+        "countryCode" => hostupreseller_tldSupportsOrgno($tld) ? "SE" : null,
+    );
+}
+
+function hostupreseller_buildV2RegistrantContact(array $params)
+{
+    $contact = hostupreseller_buildContact($params);
+    $result = array(
+        "type" => $contact["type"],
+    );
+
+    hostupreseller_setIfNotEmpty($result, "firstName", $contact["firstname"]);
+    hostupreseller_setIfNotEmpty($result, "lastName", $contact["lastname"]);
+    hostupreseller_setIfNotEmpty($result, "companyName", $contact["companyname"]);
+    hostupreseller_setIfNotEmpty($result, "email", $contact["email"]);
+    hostupreseller_setIfNotEmpty($result, "phoneNumber", $contact["phonenumber"]);
+    hostupreseller_setIfNotEmpty($result, "street", $contact["address1"]);
+    hostupreseller_setIfNotEmpty($result, "address2", $contact["address2"]);
+    hostupreseller_setIfNotEmpty($result, "city", $contact["city"]);
+    hostupreseller_setIfNotEmpty($result, "state", $contact["state"]);
+    hostupreseller_setIfNotEmpty($result, "postalCode", $contact["postcode"]);
+    hostupreseller_setIfNotEmpty($result, "countryCode", $contact["country"]);
+
+    $identifier = hostupreseller_registrationIdentifierForV2($contact["orgno"], $params["tld"] ?? "");
+    if ($identifier !== null) {
+        $result["registrationIdentifier"] = $identifier;
+    }
+
+    return $result;
+}
+
 function hostupreseller_buildClientData(array $params)
 {
     $contact = hostupreseller_buildContact($params);
-    $password = bin2hex(random_bytes(8));
-
-    return array(
-        "firstname" => $contact["firstname"],
-        "lastname" => $contact["lastname"],
-        "email" => $contact["email"],
-        "password" => $password,
-        "passwordConfirm" => $password,
-        "companyname" => $contact["companyname"],
-        "address1" => $contact["address1"],
-        "address2" => $contact["address2"],
-        "city" => $contact["city"],
-        "state" => $contact["state"],
-        "postcode" => $contact["postcode"],
-        "country" => $contact["country"],
-        "phonenumber" => $contact["phonenumber"],
-        "orgno" => $contact["orgno"],
+    $clientData = array(
         "accountType" => $contact["companyname"] ? "organisation" : "private",
-        // Turnstile/email verification is enforced by the API; this payload assumes server-to-server allowance.
     );
+
+    hostupreseller_setIfNotEmpty($clientData, "firstName", $contact["firstname"]);
+    hostupreseller_setIfNotEmpty($clientData, "lastName", $contact["lastname"]);
+    hostupreseller_setIfNotEmpty($clientData, "email", $contact["email"]);
+    hostupreseller_setIfNotEmpty($clientData, "companyName", $contact["companyname"]);
+    hostupreseller_setIfNotEmpty($clientData, "countryCode", $contact["country"]);
+    hostupreseller_setIfNotEmpty($clientData, "phoneNumber", $contact["phonenumber"]);
+
+    $address = array();
+    hostupreseller_setIfNotEmpty($address, "street", $contact["address1"]);
+    hostupreseller_setIfNotEmpty($address, "address2", $contact["address2"]);
+    hostupreseller_setIfNotEmpty($address, "city", $contact["city"]);
+    hostupreseller_setIfNotEmpty($address, "state", $contact["state"]);
+    hostupreseller_setIfNotEmpty($address, "postalCode", $contact["postcode"]);
+    if (!empty($address)) {
+        $clientData["address"] = $address;
+    }
+
+    $identifier = hostupreseller_registrationIdentifierForV2($contact["orgno"], $params["tld"] ?? "");
+    if ($identifier !== null) {
+        $clientData["registrationIdentifier"] = $identifier;
+    }
+
+    return $clientData;
 }
 
 function hostupreseller_domainString(array $params)
@@ -447,24 +570,33 @@ function hostupreseller_domainString(array $params)
 
 function hostupreseller_findDomainId(array $params, $fqdn)
 {
+    list($domain, $err) = hostupreseller_findDomain($params, $fqdn);
+    if (!$domain) {
+        return array(null, $err);
+    }
+
+    return array($domain["id"] ?? null, null);
+}
+
+function hostupreseller_findDomain(array $params, $fqdn)
+{
     $resp = hostupreseller_http(
         $params,
         "GET",
-        "/api/client-domains",
+        "/api/v2/domains",
         null,
-        array("page" => 0, "limit" => 1000)
+        array("name" => $fqdn, "limit" => 50)
     );
 
     if (!$resp["success"]) {
         return array(null, $resp["error"]);
     }
 
-    $domains = $resp["data"]["domains"] ?? array();
+    $domains = $resp["data"]["data"] ?? ($resp["data"]["domains"] ?? array());
     foreach ($domains as $domain) {
         if (isset($domain["name"]) && strcasecmp($domain["name"], $fqdn) === 0) {
-            $id = $domain["id"] ?? $domain["domainid"] ?? null;
-            if ($id !== null) {
-                return array($id, null);
+            if (!empty($domain["id"])) {
+                return array($domain, null);
             }
         }
     }
@@ -472,9 +604,20 @@ function hostupreseller_findDomainId(array $params, $fqdn)
     return array(null, "Domain {$fqdn} not found for this API key");
 }
 
+function hostupreseller_getDomainDetails(array $params, $domainId)
+{
+    return hostupreseller_http(
+        $params,
+        "GET",
+        "/api/v2/domains/" . rawurlencode($domainId)
+    );
+}
+
 function hostupreseller_normalizeExpiry(array $details)
 {
     $candidates = array(
+        $details["expiresAt"] ?? null,
+        $details["nextDueAt"] ?? null,
         $details["expires"] ?? null,
         $details["expirydate"] ?? null,
         $details["next_due"] ?? null,
@@ -503,6 +646,81 @@ function hostupreseller_normalizeExpiry(array $details)
 
     // Fallback to one year from today to avoid WHMCS "Invalid Response"
     return date("Y-m-d", strtotime("+1 year"));
+}
+
+function hostupreseller_domainStatus(array $details)
+{
+    $status = hostupreseller_cleanString($details["serviceStatus"] ?? ($details["status"] ?? ""));
+    return strtolower($status ?? "");
+}
+
+function hostupreseller_domainLifecycleType(array $details)
+{
+    if (!empty($details["lifecycle"]) && is_array($details["lifecycle"])) {
+        return strtolower((string) ($details["lifecycle"]["type"] ?? ""));
+    }
+
+    return strtolower((string) ($details["type"] ?? ""));
+}
+
+function hostupreseller_isTransferInProgress(array $details)
+{
+    if (!empty($details["lifecycle"]) && is_array($details["lifecycle"])) {
+        if (!empty($details["lifecycle"]["transferInProgress"])) {
+            return true;
+        }
+        return strtolower((string) ($details["lifecycle"]["type"] ?? "")) === "transfer"
+            && hostupreseller_domainStatus($details) === "pending";
+    }
+
+    $status = strtoupper((string) ($details["status"] ?? ""));
+    $type = strtoupper((string) ($details["type"] ?? ""));
+    return strpos($status, "TRANSFER") !== false || strpos($type, "TRANSFER") !== false;
+}
+
+function hostupreseller_requiredAcceptedTerms(array $params, $tld, $action)
+{
+    $resp = hostupreseller_http(
+        $params,
+        "GET",
+        "/api/v2/products/domains/" . rawurlencode(ltrim((string) $tld, "."))
+    );
+
+    if (!$resp["success"]) {
+        return array();
+    }
+
+    $requirements = $resp["data"]["registryRequirements"][$action] ?? array();
+    $terms = array();
+    foreach ($requirements as $requirement) {
+        if (!empty($requirement["acceptedTermsKey"])) {
+            $terms[] = $requirement["acceptedTermsKey"];
+        }
+    }
+
+    return array_values(array_unique($terms));
+}
+
+function hostupreseller_amountValue($value)
+{
+    if (is_array($value)) {
+        return isset($value["amount"]) ? (float) $value["amount"] : null;
+    }
+    if (is_numeric($value)) {
+        return (float) $value;
+    }
+    return null;
+}
+
+function hostupreseller_tldRequiresEpp(array $tldDetails)
+{
+    $requirements = $tldDetails["registryRequirements"]["transfer"] ?? array();
+    foreach ($requirements as $requirement) {
+        if (($requirement["key"] ?? null) === "eppCode" && !empty($requirement["required"])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 function hostupreseller_stripOuterQuotes($value)
@@ -672,32 +890,36 @@ function hostupreseller_RegisterDomain($params)
 
     try {
         $domain = hostupreseller_domainString($params);
-        list($productId, $productErr) = hostupreseller_getProductId($params, $params["tld"]);
-        if (!$productId) {
-            return array("error" => $productErr);
-        }
-
         $nameservers = hostupreseller_collectNameservers($params);
-        $contact = hostupreseller_buildContact($params);
+        $contact = hostupreseller_buildV2RegistrantContact($params);
         $clientData = hostupreseller_buildClientData($params);
-
-        $payload = array(
-            "clientData" => $clientData,
-            "cartItems" => array(
-                array(
-                    "type" => "register",
-                    "domain" => $domain,
-                    "productId" => (string) $productId,
-                    "years" => (int) ($params["regperiod"] ?? 1),
-                    "nameserverOption" => count($nameservers) > 0 ? "custom" : "default",
-                    "nameservers" => $nameservers,
-                    "registrantContact" => $contact,
-                ),
-            ),
-            "attemptKey" => "whmcs-register-" . uniqid(),
+        $domainItem = array(
+            "type" => "domain",
+            "action" => "register",
+            "domainName" => $domain,
+            "years" => (int) ($params["regperiod"] ?? 1),
+            "registrantContact" => $contact,
         );
 
-        $resp = hostupreseller_http($params, "POST", "/api/create-order", $payload);
+        if (count($nameservers) > 0) {
+            $domainItem["nameservers"] = $nameservers;
+        }
+
+        $acceptedTerms = hostupreseller_requiredAcceptedTerms($params, $params["tld"] ?? "", "registration");
+        if (!empty($acceptedTerms)) {
+            $domainItem["acceptedTerms"] = $acceptedTerms;
+        }
+
+        $payload = array(
+            "paymentMethod" => "invoice",
+            "clientData" => $clientData,
+            "items" => array(
+                $domainItem,
+            ),
+            "attemptKey" => "whmcs-register-" . ($params["domainid"] ?? md5($domain)) . "-" . date("YmdH"),
+        );
+
+        $resp = hostupreseller_http($params, "POST", "/api/v2/orders", $payload);
         if (!$resp["success"]) {
             if ($shouldLog) {
                 logModuleCall(
@@ -709,83 +931,6 @@ function hostupreseller_RegisterDomain($params)
                 );
             }
             return array("error" => $resp["error"]);
-        }
-
-        // Verify the domain actually exists and is active
-        list($domainId, $findErr) = hostupreseller_findDomainId($params, $domain);
-        if (!$domainId) {
-            $message = "Order created, but domain not found: " . $findErr;
-            if ($shouldLog) {
-                logModuleCall(
-                    "hostupreseller",
-                    "RegisterDomain",
-                    $payload,
-                    $resp,
-                    $message
-                );
-            }
-            return array("error" => $message);
-        }
-
-        $detailsResp = hostupreseller_http($params, "GET", "/api/domain-details/" . $domainId);
-        if ($detailsResp["success"]) {
-            $details = $detailsResp["data"]["details"] ?? array();
-            $status = strtoupper($details["status"] ?? "");
-            $orderId = $details["order_id"] ?? null;
-            $isActive = in_array($status, array("ACTIVE", "OK"));
-
-            if (!$isActive) {
-                // Allow pending/in-progress orders to pass; WHMCS will sync later
-                $pendingStatuses = array("PENDING", "IN_PROGRESS", "PROCESSING");
-                if (in_array($status, $pendingStatuses)) {
-                    $message = "Domain pending (status: {$status})";
-                    if ($orderId) {
-                        $message .= " - Hostup order {$orderId}";
-                    }
-                    if ($shouldLog) {
-                        logModuleCall(
-                            "hostupreseller",
-                            "RegisterDomain",
-                            $payload,
-                            $detailsResp,
-                            $message
-                        );
-                    }
-                    return array(
-                        "success" => true,
-                        "pending" => true,
-                        "rawdata" => $resp["data"],
-                        "orderid" => $orderId,
-                        "status" => $status,
-                    );
-                }
-
-                $message = "Domain not active (status: {$status})";
-                if ($orderId) {
-                    $message .= " - Hostup order {$orderId}";
-                }
-                if ($shouldLog) {
-                    logModuleCall(
-                        "hostupreseller",
-                        "RegisterDomain",
-                        $payload,
-                        $detailsResp,
-                        $message
-                    );
-                }
-                return array("error" => $message);
-            }
-        } else {
-            if ($shouldLog) {
-                logModuleCall(
-                    "hostupreseller",
-                    "RegisterDomain",
-                    $payload,
-                    $detailsResp,
-                    $detailsResp["error"]
-                );
-            }
-            return array("error" => $detailsResp["error"]);
         }
 
         if ($shouldLog) {
@@ -822,34 +967,38 @@ function hostupreseller_TransferDomain($params)
     $payload = null;
 
     $domain = hostupreseller_domainString($params);
-    list($productId, $productErr) = hostupreseller_getProductId($params, $params["tld"]);
-    if (!$productId) {
-        return array("error" => $productErr);
-    }
-
     $nameservers = hostupreseller_collectNameservers($params);
-    $contact = hostupreseller_buildContact($params);
+    $contact = hostupreseller_buildV2RegistrantContact($params);
     $clientData = hostupreseller_buildClientData($params);
     $epp = $params["transfersecret"] ?? $params["eppcode"] ?? "";
-
-    $payload = array(
-        "clientData" => $clientData,
-        "cartItems" => array(
-            array(
-                "type" => "transfer",
-                "domain" => $domain,
-                "productId" => (string) $productId,
-                "years" => (int) ($params["regperiod"] ?? 1),
-                "eppCode" => $epp,
-                "nameserverOption" => count($nameservers) > 0 ? "custom" : "default",
-                "nameservers" => $nameservers,
-                "registrantContact" => $contact,
-            ),
-        ),
-        "attemptKey" => "whmcs-transfer-" . uniqid(),
+    $domainItem = array(
+        "type" => "domain",
+        "action" => "transfer",
+        "domainName" => $domain,
+        "years" => (int) ($params["regperiod"] ?? 1),
+        "eppCode" => $epp,
+        "registrantContact" => $contact,
     );
 
-    $resp = hostupreseller_http($params, "POST", "/api/create-order", $payload);
+    if (count($nameservers) > 0) {
+        $domainItem["nameservers"] = $nameservers;
+    }
+
+    $acceptedTerms = hostupreseller_requiredAcceptedTerms($params, $params["tld"] ?? "", "transfer");
+    if (!empty($acceptedTerms)) {
+        $domainItem["acceptedTerms"] = $acceptedTerms;
+    }
+
+    $payload = array(
+        "paymentMethod" => "invoice",
+        "clientData" => $clientData,
+        "items" => array(
+            $domainItem,
+        ),
+        "attemptKey" => "whmcs-transfer-" . ($params["domainid"] ?? md5($domain)) . "-" . date("YmdH"),
+    );
+
+    $resp = hostupreseller_http($params, "POST", "/api/v2/orders", $payload);
     if (!$resp["success"]) {
         if ($shouldLog) {
             logModuleCall(
@@ -861,57 +1010,6 @@ function hostupreseller_TransferDomain($params)
             );
         }
         return array("error" => $resp["error"]);
-    }
-
-    // Double-check domain status to avoid false positives when Hostup fails registration
-    list($domainId, $findErr) = hostupreseller_findDomainId($params, $domain);
-    if (!$domainId) {
-        if ($shouldLog) {
-            logModuleCall(
-                "hostupreseller",
-                "TransferDomain",
-                $payload,
-                $resp,
-                "Domain not found after order creation: " . $findErr
-            );
-        }
-        return array("error" => "Order created, but domain not found: " . $findErr);
-    }
-
-    $detailsResp = hostupreseller_http($params, "GET", "/api/domain-details/" . $domainId);
-    if ($detailsResp["success"]) {
-        $details = $detailsResp["data"]["details"] ?? array();
-        $status = strtoupper($details["status"] ?? "");
-        $orderId = $details["order_id"] ?? null;
-        $isActive = in_array($status, array("ACTIVE", "OK"));
-
-        if (!$isActive) {
-            $message = "Domain not active (status: {$status})";
-            if ($orderId) {
-                $message .= " - Hostup order {$orderId}";
-            }
-            if ($shouldLog) {
-                logModuleCall(
-                    "hostupreseller",
-                    "TransferDomain",
-                    $payload,
-                    $detailsResp,
-                    $message
-                );
-            }
-            return array("error" => $message);
-        }
-    } else {
-        if ($shouldLog) {
-            logModuleCall(
-                "hostupreseller",
-                "TransferDomain",
-                $payload,
-                $detailsResp,
-                $detailsResp["error"]
-            );
-        }
-        return array("error" => $detailsResp["error"]);
     }
 
     if ($shouldLog) {
@@ -938,7 +1036,12 @@ function hostupreseller_RenewDomain($params)
         return array("error" => $err);
     }
 
-    $resp = hostupreseller_http($params, "POST", "/api/domain-renew/" . $domainId);
+    $resp = hostupreseller_http(
+        $params,
+        "POST",
+        "/api/v2/domains/" . rawurlencode($domainId) . "/actions/renew",
+        array()
+    );
     if (!$resp["success"]) {
         return array("error" => $resp["error"]);
     }
@@ -965,13 +1068,13 @@ function hostupreseller_GetDomainInformation($params)
             throw new \RuntimeException($err ?: "Domain {$domain} not found for this API key");
         }
 
-        $resp = hostupreseller_http($params, "GET", "/api/domain-details/" . $domainId);
+        $resp = hostupreseller_getDomainDetails($params, $domainId);
         if (!$resp["success"]) {
             throw new \RuntimeException($resp["error"] ?? "Unable to fetch domain details");
         }
 
-        $details = $resp["data"]["details"] ?? array();
-        $status = strtoupper($details["status"] ?? "ACTIVE");
+        $details = $resp["data"] ?? array();
+        $status = hostupreseller_domainStatus($details);
         $expiry = hostupreseller_normalizeExpiry($details);
         $nameservers = hostupreseller_extractNameservers($details);
         $nameserversAssoc = array(
@@ -982,14 +1085,15 @@ function hostupreseller_GetDomainInformation($params)
             "ns5" => $nameservers[4] ?? "",
         );
 
-        $transferLock = ($details["reglock"] ?? $details["registry_autorenew"] ?? "0") == "1";
-        $idProtection = ($details["idprotection"] ?? "0") == "1";
+        $transferLock = !empty($details["lifecycle"]["registrarLockEnabled"])
+            || !empty($details["registryLock"]["enabled"]);
+        $idProtection = !empty($details["whoisPrivacy"]["enabled"]);
 
         $domainObj = new RegistrarDomain();
         $domainObj
             ->setDomain($domain)
             ->setNameservers($nameserversAssoc)
-            ->setRegistrationStatus($status)
+            ->setRegistrationStatus($status ?: "unknown")
             ->setTransferLock($transferLock)
             ->setExpiryDate(Carbon::createFromFormat("Y-m-d", $expiry))
             ->setIdProtectionStatus($idProtection);
@@ -1040,7 +1144,11 @@ function hostupreseller_GetNameservers($params)
         return array("error" => $err);
     }
 
-    $resp = hostupreseller_http($params, "GET", "/api/domain-details/" . $domainId);
+    $resp = hostupreseller_http(
+        $params,
+        "GET",
+        "/api/v2/domains/" . rawurlencode($domainId) . "/nameservers"
+    );
     if (!$resp["success"]) {
         if ($shouldLog) {
             logModuleCall("hostupreseller", "GetNameservers:error", $logCtx, $resp, $resp["error"]);
@@ -1048,19 +1156,7 @@ function hostupreseller_GetNameservers($params)
         return array("error" => $resp["error"]);
     }
 
-    $details = $resp["data"]["details"] ?? array();
-    $nameservers = array();
-
-    if (!empty($details["nameservers"]) && is_array($details["nameservers"])) {
-        $nameservers = $details["nameservers"];
-    } else {
-        for ($i = 1; $i <= 5; $i++) {
-            $key = "ns{$i}";
-            if (!empty($details[$key])) {
-                $nameservers[] = $details[$key];
-            }
-        }
-    }
+    $nameservers = $resp["data"]["nameservers"] ?? array();
 
     $result = array(
         "ns1" => $nameservers[0] ?? "",
@@ -1097,7 +1193,12 @@ function hostupreseller_SaveNameservers($params)
         "nameservers" => $nameservers,
     );
 
-    $resp = hostupreseller_http($params, "POST", "/api/domains/" . $domainId . "/nameservers", $payload);
+    $resp = hostupreseller_http(
+        $params,
+        "POST",
+        "/api/v2/domains/" . rawurlencode($domainId) . "/nameservers",
+        $payload
+    );
     if (!$resp["success"]) {
         return array("error" => $resp["error"]);
     }
@@ -1116,30 +1217,36 @@ function hostupreseller_GetContactDetails($params)
         return array("error" => $err);
     }
 
-    $resp = hostupreseller_http($params, "GET", "/api/domain-contacts/" . $domainId);
+    $resp = hostupreseller_http(
+        $params,
+        "GET",
+        "/api/v2/domains/" . rawurlencode($domainId) . "/contacts"
+    );
     if (!$resp["success"]) {
         return array("error" => $resp["error"]);
     }
 
-    $contact = $resp["data"]["contacts"]["registrant"] ?? $resp["data"]["contacts"] ?? array();
+    $contact = $resp["data"]["registrant"] ?? array();
 
     $fields = array(
-        "First Name" => $contact["firstname"] ?? "",
-        "Last Name" => $contact["lastname"] ?? "",
-        "Company Name" => $contact["companyname"] ?? "",
+        "First Name" => $contact["firstName"] ?? "",
+        "Last Name" => $contact["lastName"] ?? "",
+        "Company Name" => $contact["companyName"] ?? "",
         "Email Address" => $contact["email"] ?? "",
-        "Address 1" => $contact["address1"] ?? "",
+        "Address 1" => $contact["street"] ?? "",
+        "Address 2" => $contact["address2"] ?? "",
         "City" => $contact["city"] ?? "",
         "State" => $contact["state"] ?? "",
-        "Postcode" => $contact["postcode"] ?? "",
-        "Country" => $contact["country"] ?? "",
-        "Phone Number" => $contact["phonenumber"] ?? "",
+        "Postcode" => $contact["postalCode"] ?? "",
+        "Country" => $contact["countryCode"] ?? "",
+        "Phone Number" => $contact["phoneNumber"] ?? "",
     );
 
     // Expose organisation/person number on supported TLDs so it can be edited in WHMCS
     if (hostupreseller_tldSupportsOrgno($params["tld"] ?? "")) {
-        $label = !empty($contact["companyname"]) ? "Organisation Number" : "Personnummer";
-        $fields[$label] = hostupreseller_formatOrgnoForDisplay($contact["orgno"] ?? "");
+        $label = !empty($contact["companyName"]) ? "Organisation Number" : "Personnummer";
+        $identifier = $contact["registrationIdentifier"]["value"] ?? "";
+        $fields[$label] = hostupreseller_formatOrgnoForDisplay($identifier);
     }
 
     return array(
@@ -1160,18 +1267,18 @@ function hostupreseller_SaveContactDetails($params)
 
     $details = $params["contactdetails"]["Registrant"] ?? array();
 
-    $update = array(
-        "firstname" => $details["First Name"] ?? "",
-        "lastname" => $details["Last Name"] ?? "",
-        "companyname" => $details["Company Name"] ?? "",
-        "email" => $details["Email Address"] ?? "",
-        "address1" => $details["Address 1"] ?? "",
-        "city" => $details["City"] ?? "",
-        "state" => $details["State"] ?? "",
-        "postcode" => $details["Postcode"] ?? "",
-        "country" => $details["Country"] ?? "",
-        "phonenumber" => $details["Phone Number"] ?? "",
-    );
+    $update = array();
+    hostupreseller_setIfNotEmpty($update, "firstName", $details["First Name"] ?? "");
+    hostupreseller_setIfNotEmpty($update, "lastName", $details["Last Name"] ?? "");
+    hostupreseller_setIfNotEmpty($update, "companyName", $details["Company Name"] ?? "");
+    hostupreseller_setIfNotEmpty($update, "email", $details["Email Address"] ?? "");
+    hostupreseller_setIfNotEmpty($update, "street", $details["Address 1"] ?? "");
+    hostupreseller_setIfNotEmpty($update, "address2", $details["Address 2"] ?? "");
+    hostupreseller_setIfNotEmpty($update, "city", $details["City"] ?? "");
+    hostupreseller_setIfNotEmpty($update, "state", $details["State"] ?? "");
+    hostupreseller_setIfNotEmpty($update, "postalCode", $details["Postcode"] ?? "");
+    hostupreseller_setIfNotEmpty($update, "countryCode", $details["Country"] ?? "");
+    hostupreseller_setIfNotEmpty($update, "phoneNumber", $details["Phone Number"] ?? "");
 
     // Map organisation/person number back to API for supported TLDs
     if (hostupreseller_tldSupportsOrgno($params["tld"] ?? "")) {
@@ -1182,13 +1289,21 @@ function hostupreseller_SaveContactDetails($params)
             $orgnoInput = $details["Personnummer"];
         }
         if ($orgnoInput !== null) {
-            $update["orgno"] = hostupreseller_formatOrgnoForApi($orgnoInput, $params["tld"] ?? "");
+            $identifier = hostupreseller_registrationIdentifierForV2($orgnoInput, $params["tld"] ?? "");
+            if ($identifier !== null) {
+                $update["registrationIdentifier"] = $identifier;
+            }
         }
     }
 
-    $payload = array("updateContactInfo" => $update);
+    $payload = array("registrant" => $update);
 
-    $resp = hostupreseller_http($params, "POST", "/api/domain-contacts/" . $domainId, $payload);
+    $resp = hostupreseller_http(
+        $params,
+        "POST",
+        "/api/v2/domains/" . rawurlencode($domainId) . "/contacts",
+        $payload
+    );
     if (!$resp["success"]) {
         return array("error" => $resp["error"]);
     }
@@ -1207,17 +1322,26 @@ function hostupreseller_GetEPPCode($params)
         return array("error" => $err);
     }
 
-    $resp = hostupreseller_http($params, "POST", "/api/domain-epp/" . $domainId);
+    $resp = hostupreseller_http(
+        $params,
+        "POST",
+        "/api/v2/domains/" . rawurlencode($domainId) . "/actions/request-epp",
+        array()
+    );
     if (!$resp["success"]) {
         return array("error" => $resp["error"]);
     }
 
-    $code = $resp["data"]["epp_code"] ?? ($resp["data"]["message"] ?? "");
-    return array("eppcode" => $code);
+    $code = $resp["data"]["eppCode"] ?? null;
+    if ($code) {
+        return array("eppcode" => $code);
+    }
+
+    return array("success" => "success");
 }
 
 /**
- * Availability check using queued domain-check endpoint
+ * Availability check using v2 queued availability endpoint
  * Polls until job completes or timeout (max 15 seconds)
  * Returns WHMCS ResultsList with SearchResult objects
  */
@@ -1235,41 +1359,44 @@ function hostupreseller_CheckAvailability($params)
             : array("." . ltrim($params["tld"] ?? "", "."));
     }
 
-    // Normalize TLDs to have leading dot
-    $tlds = array();
+    // Normalize TLDs and submit full domain names to v2 availability.
+    $names = array();
     foreach ($tldsToInclude as $tld) {
-        $tlds[] = "." . ltrim($tld, ".");
+        $names[] = $searchTerm . "." . ltrim($tld, ".");
     }
 
-    $payload = array("sld" => $searchTerm, "tlds" => $tlds);
-    $resp = hostupreseller_http($params, "POST", "/api/domain-check", $payload);
+    $payload = array("names" => $names);
+    $resp = hostupreseller_http($params, "POST", "/api/v2/domains/availability", $payload);
     if (!$resp["success"]) {
         throw new \RuntimeException("Domain check failed: " . ($resp["error"] ?? "unknown error"));
     }
 
-    $jobId = $resp["data"]["jobId"] ?? null;
-    if (!$jobId) {
-        throw new \RuntimeException("Domain check job not created");
-    }
+    $apiResults = $resp["data"]["data"] ?? array();
+    $pollUrl = $resp["data"]["operation"]["pollUrl"] ?? null;
 
-    // Poll until completed or timeout (max 15 seconds, poll every 500ms)
-    $maxAttempts = 30;
-    $apiResults = array();
-    $jobStatus = "pending";
+    if (empty($apiResults) && $pollUrl) {
+        // Poll until completed or timeout (max 15 seconds, poll every 500ms)
+        $maxAttempts = 30;
+        $jobStatus = "processing";
 
-    for ($attempt = 0; $attempt < $maxAttempts; $attempt++) {
-        usleep(500000); // 500ms between polls
+        for ($attempt = 0; $attempt < $maxAttempts; $attempt++) {
+            usleep(500000); // 500ms between polls
 
-        $statusResp = hostupreseller_http($params, "GET", "/api/domain-check/" . $jobId);
-        if (!$statusResp["success"]) {
-            continue;
-        }
+            $statusResp = hostupreseller_http($params, "GET", $pollUrl);
+            if (!$statusResp["success"]) {
+                continue;
+            }
 
-        $jobStatus = $statusResp["data"]["status"] ?? "pending";
-        $apiResults = $statusResp["data"]["results"] ?? array();
+            $jobStatus = $statusResp["data"]["status"] ?? "processing";
+            $apiResults = $statusResp["data"]["data"] ?? array();
 
-        if ($jobStatus === "completed" || !empty($apiResults)) {
-            break;
+            if ($jobStatus === "completed" || !empty($apiResults)) {
+                break;
+            }
+
+            if ($jobStatus === "failed") {
+                throw new \RuntimeException($statusResp["data"]["reason"] ?? "Domain availability check failed");
+            }
         }
     }
 
@@ -1281,7 +1408,7 @@ function hostupreseller_CheckAvailability($params)
     $results = new ResultsList();
 
     foreach ($apiResults as $item) {
-        $domainName = $item["domain"] ?? "";
+        $domainName = $item["name"] ?? ($item["domain"] ?? "");
         if (empty($domainName)) {
             continue;
         }
@@ -1298,9 +1425,9 @@ function hostupreseller_CheckAvailability($params)
 
         // Map status
         $itemStatus = strtolower($item["status"] ?? "");
-        if ($itemStatus === "available") {
+        if (!empty($item["available"]) || $itemStatus === "available") {
             $searchResult->setStatus(SearchResult::STATUS_NOT_REGISTERED);
-        } elseif ($itemStatus === "registered" || $itemStatus === "unavailable") {
+        } elseif ($itemStatus === "registered" || $itemStatus === "unavailable" || $itemStatus === "") {
             $searchResult->setStatus(SearchResult::STATUS_REGISTERED);
         } elseif ($itemStatus === "reserved") {
             $searchResult->setStatus(SearchResult::STATUS_RESERVED);
@@ -1311,8 +1438,8 @@ function hostupreseller_CheckAvailability($params)
         // Handle premium domains if enabled
         if ($premiumEnabled && !empty($item["premium"])) {
             $searchResult->setPremiumDomain(true);
-            $registerPrice = $item["price"] ?? ($item["periods"]["1"]["register"] ?? 0);
-            $renewPrice = $item["renewalPrice"] ?? ($item["periods"]["1"]["renew"] ?? 0);
+            $registerPrice = hostupreseller_amountValue($item["billing"] ?? null) ?? 0;
+            $renewPrice = $item["renewalAmount"] ?? 0;
             $searchResult->setPremiumCostPricing(array(
                 "register" => $registerPrice,
                 "renew" => $renewPrice,
@@ -1327,11 +1454,127 @@ function hostupreseller_CheckAvailability($params)
 }
 
 /**
- * TLD pricing not exposed via API; return empty to let WHMCS keep manual pricing
+ * Sync TLD pricing for .se and .nu from HostUp API
+ * Used by WHMCS Utilities > Registrar TLD Sync
+ * @see https://developers.whmcs.com/domain-registrars/tld-pricing-sync/
  */
 function hostupreseller_GetTldPricing($params)
 {
-    return array("error" => "TLD pricing is managed in HostUp; configure pricing in WHMCS");
+    $shouldLog = !empty($params["debug"]) && function_exists("logModuleCall");
+
+    // Only sync .se and .nu
+    $supportedTlds = array(".se", ".nu");
+
+    // Fetch available TLDs from the v2 public catalog.
+    $resp = hostupreseller_http($params, "GET", "/api/v2/products/domains");
+    if (!$resp["success"]) {
+        $error = $resp["error"] ?? "Failed to fetch TLD list";
+        if ($shouldLog) {
+            logModuleCall("hostupreseller", "GetTldPricing", array(), $resp, $error);
+        }
+        return array("error" => $error);
+    }
+
+    $products = $resp["data"]["tlds"] ?? array();
+    $results = new TldResultsList();
+
+    foreach ($products as $product) {
+        $tld = strtolower($product["tld"] ?? "");
+
+        // Only process .se and .nu
+        if (!in_array($tld, $supportedTlds, true)) {
+            continue;
+        }
+
+        // Fetch detailed pricing for this TLD
+        $detailsResp = hostupreseller_http(
+            $params,
+            "GET",
+            "/api/v2/products/domains/" . rawurlencode(ltrim($tld, "."))
+        );
+
+        if (!$detailsResp["success"]) {
+            if ($shouldLog) {
+                logModuleCall(
+                    "hostupreseller",
+                    "GetTldPricing:details",
+                    array("tld" => $tld),
+                    $detailsResp,
+                    $detailsResp["error"] ?? "Failed to fetch TLD details"
+                );
+            }
+            continue;
+        }
+
+        $data = $detailsResp["data"] ?? array();
+        $domainPricing = $data["domainPricing"] ?? array();
+        $oneYear = null;
+        $years = array();
+        foreach ($domainPricing as $row) {
+            if (!empty($row["years"])) {
+                $years[] = (int) $row["years"];
+            }
+            if ((int) ($row["years"] ?? 0) === 1) {
+                $oneYear = $row;
+            }
+        }
+
+        // Extract prices from the canonical v2 money objects.
+        $registerPrice = hostupreseller_amountValue($oneYear["register"] ?? ($data["register"] ?? null)) ?? 0;
+        $renewPrice = hostupreseller_amountValue($oneYear["renew"] ?? ($data["renew"] ?? null)) ?? 0;
+        $transferPrice = hostupreseller_amountValue($oneYear["transfer"] ?? ($data["transfer"] ?? null));
+        $currency = $data["billing"]["currencyCode"]
+            ?? ($data["register"]["currencyCode"] ?? ($data["renew"]["currencyCode"] ?? "SEK"));
+
+        // Skip if no valid pricing found
+        if ($registerPrice <= 0 && $renewPrice <= 0) {
+            continue;
+        }
+
+        // Build ImportItem with pricing
+        sort($years);
+        $item = (new ImportItem())
+            ->setExtension($tld)
+            ->setMinYears(!empty($years) ? min($years) : 1)
+            ->setMaxYears(!empty($years) ? max($years) : 1)
+            ->setRegisterPrice($registerPrice)
+            ->setRenewPrice($renewPrice)
+            ->setTransferPrice($transferPrice)
+            ->setCurrency($currency)
+            ->setEppRequired(hostupreseller_tldRequiresEpp($data)); // Derived from v2 registry requirements
+
+        if (!empty($years) && method_exists($item, "setYears")) {
+            $item->setYears($years);
+        }
+
+        $results[] = $item;
+
+        if ($shouldLog) {
+            logModuleCall(
+                "hostupreseller",
+                "GetTldPricing:item",
+                array("tld" => $tld),
+                array(
+                    "register" => $registerPrice,
+                    "renew" => $renewPrice,
+                    "transfer" => $transferPrice,
+                ),
+                "success"
+            );
+        }
+    }
+
+    if ($shouldLog) {
+        logModuleCall(
+            "hostupreseller",
+            "GetTldPricing:complete",
+            array(),
+            array("count" => count($results)),
+            "success"
+        );
+    }
+
+    return $results;
 }
 
 // Optional functions not supported by HostUp API today
@@ -1676,7 +1919,23 @@ function hostupreseller_Sync($params)
             return array("error" => $err);
         }
 
-        $resp = hostupreseller_http($params, "GET", "/api/domain-details/" . $domainId);
+        $syncResp = hostupreseller_http(
+            $params,
+            "POST",
+            "/api/v2/domains/" . rawurlencode($domainId) . "/actions/status-sync",
+            array()
+        );
+        if (!$syncResp["success"] && $shouldLog) {
+            logModuleCall(
+                "hostupreseller",
+                "Sync:status-sync",
+                $logCtx,
+                $syncResp,
+                $syncResp["error"] ?? "Status sync failed"
+            );
+        }
+
+        $resp = hostupreseller_getDomainDetails($params, $domainId);
         if (!$resp["success"]) {
             if ($shouldLog) {
                 logModuleCall(
@@ -1690,8 +1949,8 @@ function hostupreseller_Sync($params)
             return array("error" => $resp["error"]);
         }
 
-        $details = $resp["data"]["details"] ?? array();
-        $status = strtoupper($details["status"] ?? "");
+        $details = $resp["data"] ?? array();
+        $status = hostupreseller_domainStatus($details);
         $expiry = hostupreseller_normalizeExpiry($details);
 
         $result = array(
@@ -1701,15 +1960,15 @@ function hostupreseller_Sync($params)
         );
 
         // Map status flags expected by WHMCS
-        if (in_array($status, array("ACTIVE", "OK", "OK (AUTORENEW)"))) {
+        if ($status === "active") {
             $result["active"] = true;
-        } elseif ($status === "EXPIRED") {
+        } elseif ($status === "expired") {
             $result["expired"] = true;
-        } elseif ($status === "CANCELLED" || $status === "CANCELED") {
+        } elseif ($status === "cancelled" || $status === "terminated") {
             $result["cancelled"] = true;
-        } elseif (in_array($status, array("TRANSFERRED", "TRANSFERRED AWAY"))) {
+        } elseif ($status === "transferred_away" || $status === "transferredaway") {
             $result["transferredAway"] = true;
-        } elseif ($status === "SUSPENDED") {
+        } elseif ($status === "suspended") {
             $result["suspended"] = true;
         }
 
@@ -1754,19 +2013,32 @@ function hostupreseller_TransferSync($params)
             throw new \RuntimeException($err ?: "Domain {$domain} not found for this API key");
         }
 
-        $resp = hostupreseller_http($params, "GET", "/api/domain-details/" . $domainId);
+        $syncResp = hostupreseller_http(
+            $params,
+            "POST",
+            "/api/v2/domains/" . rawurlencode($domainId) . "/actions/status-sync",
+            array()
+        );
+        if (!$syncResp["success"] && $shouldLog) {
+            logModuleCall(
+                "hostupreseller",
+                "TransferSync:status-sync",
+                $logCtx,
+                $syncResp,
+                $syncResp["error"] ?? "Status sync failed"
+            );
+        }
+
+        $resp = hostupreseller_getDomainDetails($params, $domainId);
         if (!$resp["success"]) {
             throw new \RuntimeException($resp["error"] ?? "Unable to fetch domain details");
         }
 
-        $details = $resp["data"]["details"] ?? array();
-        $status = strtoupper($details["status"] ?? "");
+        $details = $resp["data"] ?? array();
+        $status = hostupreseller_domainStatus($details);
         $expiry = hostupreseller_normalizeExpiry($details);
 
-        $completedStatuses = array("ACTIVE", "OK", "REGISTERED");
-        $pendingStatuses = array("PENDING", "PENDING TRANSFER", "TRANSFER", "PROCESSING", "IN_PROGRESS");
-
-        if (in_array($status, $completedStatuses)) {
+        if ($status === "active") {
             $result = array(
                 "completed" => true,
                 "expirydate" => $expiry,
@@ -1777,7 +2049,7 @@ function hostupreseller_TransferSync($params)
             return $result;
         }
 
-        if (in_array($status, $pendingStatuses)) {
+        if ($status === "pending" || hostupreseller_isTransferInProgress($details)) {
             if ($shouldLog) {
                 logModuleCall("hostupreseller", "TransferSync:pending", $logCtx, $resp, $status);
             }
@@ -1821,4 +2093,100 @@ function hostupreseller_ResendIRTPVerificationEmail($params)
 function hostupreseller_AdminCustomButtonArray()
 {
     return array();
+}
+
+/**
+ * Client area custom buttons
+ * Adds buttons to the domain management page in the client area
+ */
+function hostupreseller_ClientAreaCustomButtonArray()
+{
+    return array(
+        "Get EPP Code" => "getEppCodeClient",
+    );
+}
+
+/**
+ * Client area allowed functions
+ * Defines which custom functions can be invoked from the client area
+ */
+function hostupreseller_ClientAreaAllowedFunctions()
+{
+    return array(
+        "getEppCodeClient",
+    );
+}
+
+/**
+ * Get EPP code from client area
+ * Called when customer clicks "Get EPP Code" button
+ */
+function hostupreseller_getEppCodeClient($params)
+{
+    $result = hostupreseller_GetEPPCode($params);
+
+    if (isset($result["error"])) {
+        return array(
+            "success" => false,
+            "errorMessage" => $result["error"],
+        );
+    }
+
+    $eppCode = $result["eppcode"] ?? "";
+
+    return array(
+        "success" => true,
+        "eppcode" => $eppCode,
+    );
+}
+
+/**
+ * Client area output
+ * Renders custom HTML/template in the domain details client area page
+ */
+function hostupreseller_ClientArea($params)
+{
+    $domain = hostupreseller_domainString($params);
+    $tld = "." . ltrim($params["tld"] ?? "", ".");
+
+    // Build informational output for .se/.nu domains
+    $output = "";
+
+    if (hostupreseller_tldSupportsOrgno($tld)) {
+        $output .= '<div class="alert alert-info">';
+        $output .= '<strong>Svensk domän</strong><br>';
+        $output .= 'För att flytta denna domän till en annan registrar, ';
+        if ($tld === ".nu") {
+            $output .= 'behöver du en EPP-kod (authcode). Klicka på "Get EPP Code" ovan.';
+        } else {
+            $output .= 'kontakta vår support. .se-domäner kräver ingen EPP-kod.';
+        }
+        $output .= '</div>';
+    }
+
+    return $output;
+}
+
+/**
+ * Additional domain fields for .se and .nu TLDs
+ * Displays identification number field during domain registration/transfer
+ * @see https://developers.whmcs.com/domain-registrars/domain-information/
+ */
+function hostupreseller_AdditionalDomainFields()
+{
+    $identificationField = array(
+        "Name" => "Identification Number",
+        "LangVar" => "identificationnumber",
+        "DisplayName" => "Personnummer / Organisationsnummer",
+        "Type" => "text",
+        "Size" => 20,
+        "Required" => true,
+        "Description" => "Ange personnummer (ÅÅMMDD-XXXX) eller organisationsnummer (XXXXXX-XXXX)",
+        "Ispapi-Name" => "X-SE-REGISTRANT-IDNUMBER",
+    );
+
+    return array(
+        ".se" => array($identificationField),
+        ".nu" => array($identificationField),
+    );
 }
