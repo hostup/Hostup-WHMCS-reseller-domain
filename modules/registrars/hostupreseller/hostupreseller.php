@@ -2120,26 +2120,90 @@ function hostupreseller_ClientAreaAllowedFunctions()
     );
 }
 
+function hostupreseller_clientAreaDomainId(array $params)
+{
+    if (!empty($params["domainid"])) {
+        return (int) $params["domainid"];
+    }
+    if (!empty($params["id"])) {
+        return (int) $params["id"];
+    }
+    return 0;
+}
+
+function hostupreseller_html($value)
+{
+    return htmlspecialchars((string) $value, ENT_QUOTES, "UTF-8");
+}
+
 /**
  * Get EPP code from client area
  * Called when customer clicks "Get EPP Code" button
  */
 function hostupreseller_getEppCodeClient($params)
 {
-    $result = hostupreseller_GetEPPCode($params);
+    $domain = hostupreseller_domainString($params);
+    $domainId = hostupreseller_clientAreaDomainId($params);
+    $tld = "." . ltrim(strtolower((string) ($params["tld"] ?? "")), ".");
+    $backUrl = $domainId > 0
+        ? "clientarea.php?action=domaindetails&id=" . $domainId
+        : "clientarea.php?action=domains";
 
-    if (isset($result["error"])) {
+    $vars = array(
+        "domainid" => $domainId,
+        "domain" => $domain,
+        "backUrl" => $backUrl,
+        "success" => false,
+        "eppcode" => "",
+        "requestSubmitted" => false,
+        "errorMessage" => "",
+    );
+
+    if ($tld === ".se") {
+        $vars["errorMessage"] = "This domain extension does not use transfer codes. Please contact support if you need help transferring the domain.";
+
         return array(
-            "success" => false,
-            "errorMessage" => $result["error"],
+            "templatefile" => "eppcode",
+            "breadcrumb" => array(
+                $backUrl => "Domain Details",
+            ),
+            "vars" => $vars,
         );
     }
 
-    $eppCode = $result["eppcode"] ?? "";
+    $result = hostupreseller_GetEPPCode($params);
+
+    if (isset($result["error"])) {
+        $vars["errorMessage"] = "The transfer code could not be requested right now. Please contact support.";
+        if (!empty($params["debug"]) && function_exists("logModuleCall")) {
+            logModuleCall(
+                "hostupreseller",
+                "getEppCodeClient",
+                array("domain" => $domain),
+                $result,
+                $result["error"]
+            );
+        }
+
+        return array(
+            "templatefile" => "eppcode",
+            "breadcrumb" => array(
+                $backUrl => "Domain Details",
+            ),
+            "vars" => $vars,
+        );
+    }
+
+    $vars["success"] = true;
+    $vars["eppcode"] = $result["eppcode"] ?? "";
+    $vars["requestSubmitted"] = $vars["eppcode"] === "";
 
     return array(
-        "success" => true,
-        "eppcode" => $eppCode,
+        "templatefile" => "eppcode",
+        "breadcrumb" => array(
+            $backUrl => "Domain Details",
+        ),
+        "vars" => $vars,
     );
 }
 
@@ -2150,7 +2214,8 @@ function hostupreseller_getEppCodeClient($params)
 function hostupreseller_ClientArea($params)
 {
     $domain = hostupreseller_domainString($params);
-    $tld = "." . ltrim($params["tld"] ?? "", ".");
+    $domainId = hostupreseller_clientAreaDomainId($params);
+    $tld = "." . ltrim(strtolower((string) ($params["tld"] ?? "")), ".");
 
     // Build informational output for .se/.nu domains
     $output = "";
@@ -2160,10 +2225,25 @@ function hostupreseller_ClientArea($params)
         $output .= '<strong>Svensk domän</strong><br>';
         $output .= 'För att flytta denna domän till en annan registrar, ';
         if ($tld === ".nu") {
-            $output .= 'behöver du en EPP-kod (authcode). Klicka på "Get EPP Code" ovan.';
+            $output .= 'behöver du en EPP-kod (authcode). Använd knappen för överföringskod nedan.';
         } else {
             $output .= 'kontakta vår support. .se-domäner kräver ingen EPP-kod.';
         }
+        $output .= '</div>';
+    }
+
+    if ($tld !== ".se" && $domainId > 0) {
+        $output .= '<div class="panel panel-default">';
+        $output .= '<div class="panel-heading"><h3 class="panel-title">Transfer Code</h3></div>';
+        $output .= '<div class="panel-body">';
+        $output .= '<p>Use this when you want to transfer ' . hostupreseller_html($domain) . ' to another registrar.</p>';
+        $output .= '<form method="post" action="clientarea.php?action=domaindetails">';
+        $output .= '<input type="hidden" name="domainid" value="' . $domainId . '" />';
+        $output .= '<input type="hidden" name="modop" value="custom" />';
+        $output .= '<input type="hidden" name="a" value="getEppCodeClient" />';
+        $output .= '<button type="submit" class="btn btn-primary">Request transfer code</button>';
+        $output .= '</form>';
+        $output .= '</div>';
         $output .= '</div>';
     }
 
